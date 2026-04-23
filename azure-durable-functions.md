@@ -1,249 +1,257 @@
-# Azure Durable Functions
+# Azure Blob Storage
 
 ---
 
-## What Problem Do They Solve?
+## What Is a Storage Account?
 
-Regular Azure Functions are stateless. They run once and die. If you need a multi-step pipeline (query data → export PDFs → email members → log results), a regular function can't coordinate that. You'd have to manage queues, track state, handle retries, and aggregate results yourself.
+A top-level Azure resource that holds all your storage services. Think of it as a container for containers. One storage account can hold:
 
-Durable Functions give you orchestration, state persistence, and parallel execution on top of stateless infrastructure. You write sequential Python code. The framework handles the distributed systems work underneath.
+- **Blob Storage** — unstructured data like files, PDFs, images
+- **Queue Storage** — message queues for async communication
+- **Table Storage** — NoSQL key-value storage (Durable Functions uses this for replay state)
+- **File Storage** — managed file shares (SMB protocol)
+
+Durable Functions uses table and queue storage behind the scenes for orchestration state. You don't configure that part — the framework manages it automatically.
 
 ---
 
-## The Three Components
+## Blob Storage Structure
 
-Every Durable Function has three parts. All three are required.
+Three levels of hierarchy:
 
-**Client** — Starts the orchestration. Doesn't do any work itself. Just says "go."
-
-```python
-# Timer trigger that starts the orchestrator
-@app.timer_trigger(arg_name="timer", schedule="0 0 14 25-31 * *")
-@app.durable_client_input(client_name="client")
-async def monthly_trigger(timer: func.TimerRequest, client):
-    instance_id = await client.start_new("report_orchestrator")
+```
+Storage Account (mystorageaccount)
+  └── Container (e.g., "reports")
+       └── Blob (e.g., "Acme Corp – Staples – March 2026.pdf")
 ```
 
-**Orchestrator** — Coordinates the workflow. Calls activities, handles branching, tracks progress. This is the brain. It never does I/O directly.
+A **container** is like a folder at the top level. You can't nest containers. A **blob** is any file — PDF, CSV, image, whatever. The blob name can include `/` to simulate folder structure (`2026/03/report.pdf`) but those aren't real folders, just naming conventions.
+
+---
+
+## Authentication: Two Approaches
+
+### Storage Account Keys (avoid when possible)
+
+Two static keys (key1, key2) generated when the account is created. Full read/write/delete access to everything. Never expire.
+
+Where they live: Azure Portal → Storage Account → Access Keys.
+
+Problems:
+- If leaked, an attacker owns your entire storage account
+- No audit trail of who used them
+- Must be manually rotated
+- Stored as secrets in config, which means they can end up in code, .env files, or deployment logs
+
+### Managed Identity (recommended)
+
+The Function App has a system-assigned managed identity. Azure AD handles authentication automatically. No secrets stored anywhere.
 
 ```python
-@app.orchestration_trigger(context_name="context")
-def report_orchestrator(context: df.DurableOrchestrationContext):
-    return orchestrator_function(context)
+# DefaultAzureCredential picks up managed identity in Azure
+# and your dev credentials locally
+from azure.identity import DefaultAzureCredential
+
+credential = DefaultAzureCredential()
+blob_service = BlobServiceClient(
+    account_url=f"https://{account_name}.blob.core.windows.net",
+    credential=credential,
+)
 ```
 
-**Activities** — Do the actual work. Database queries, API calls, file uploads, emails. These are the hands.
+Benefits:
+- No secrets to rotate or leak
+- Audit logs in Azure AD
+- Revoke access by disabling the identity
+- Works locally with your developer credentials via `DefaultAzureCredential`
+
+---
+
+## Uploading Blobs
 
 ```python
-@app.activity_trigger(input_name="job")
-def export_and_upload(job: dict):
-    return _export_and_upload(job)
+blob_client = blob_service.get_blob_client(
+    container=container_name,
+    blob=blob_name,
+)
+blob_client.upload_blob(data, overwrite=True)
 ```
 
----
-
-## How Registration Works
-
-When the Function App starts, the runtime scans all decorators and builds a registry:
-
-- `@app.orchestration_trigger` → registers an orchestrator
-- `@app.activity_trigger` → registers an activity
-- `@app.timer_trigger` → registers a timer function
-- `@app.route` → registers an HTTP function
-- `@app.durable_client_input` → injects a client to start orchestrations
-
-The decorated function's **Python name** becomes its identifier. `context.call_activity("export_and_upload", job)` looks up the function named `export_and_upload` in the registry. The name in `call_activity` must match the decorated function name exactly. File names don't matter — they're convention, not a requirement.
+`overwrite=True` is important. Without it, uploading to an existing blob name throws an error. With it, the old blob is silently replaced. For idempotent pipelines where reruns are expected, this prevents failures on duplicate uploads.
 
 ---
 
-## Replay: The Core Mechanism
+## SAS Tokens: Temporary Access Links
 
-The orchestrator doesn't stay alive in memory while activities run. That would waste resources and wouldn't survive crashes.
+A **Shared Access Signature (SAS) token** is a URL query string that grants time-limited access to a specific blob without requiring authentication. The member clicks a link, downloads the PDF, no Azure AD login needed.
 
-Instead, the framework uses **replay**:
+A SAS URL looks like:
 
-1. Orchestrator runs, hits `yield context.call_activity(...)`.
-2. Framework saves the orchestrator's state to Azure Storage, schedules the activity, and **kills the function**.
-3. Activity runs on its own, finishes, result is saved to Azure Storage.
-4. Framework **restarts the orchestrator from line 1**.
-5. On replay, every `yield` that already completed returns its saved result instantly — no actual work.
-6. Orchestrator fast-forwards to the next unfinished `yield`.
-
-If there are 10 `yield` calls and you're on the 7th, the orchestrator has already run 7 times. Each time it replayed from the top, skipped past completed yields, and stopped at the next one.
-
-**Why replay?** Python doesn't have a "resume from line 15" feature. The only way to get back to where you were is to re-run from the top and skip past completed work. The `yield` points are checkpoints. The saved results are how the framework knows what to skip.
-
----
-
-## Determinism: The One Rule
-
-Because the orchestrator replays from the top every time, it **must produce the same sequence of decisions on every run**. This is called determinism.
-
-**Banned inside orchestrators:**
-
-- `datetime.now()` — returns different values on each replay
-- API calls — responses can change
-- Database queries — data can change
-- `random.random()` — different every time
-- Any I/O whatsoever
-
-**Safe inside orchestrators:**
-
-- `context.current_utc_datetime` — frozen to when the orchestration first started, same across all replays
-- `context.call_activity(...)` — delegates work to activities, results are saved
-- Config values loaded at module level — constants for the life of the worker
-- Pure logic (math, string manipulation, conditionals based on saved results)
-
-**Why it matters:** If the orchestrator takes a different code path on replay, the sequence of `yield` calls won't match the saved history. The framework throws an exception and the orchestration fails.
-
----
-
-## yield and context.call_activity
-
-`context.call_activity("name", input)` doesn't run the activity immediately. It creates a task object. `yield` hands that task to the framework.
-
-The framework looks at the task and decides:
-
-- **"I don't have a result for this yet"** → schedule the activity, save state, shut down the orchestrator
-- **"I already ran this on a previous replay"** → return the saved result instantly, keep going
-
-```python
-# This is a checkpoint. On first run, it schedules build_snapshot.
-# On replay, it returns the saved result immediately.
-snapshot = yield context.call_activity("build_snapshot", None)
+```
+https://mystorageaccount.blob.core.windows.net/reports/report.pdf?sv=2022-11-02&se=2026-04-28&sr=b&sp=r&sig=abc123...
 ```
 
+Key parameters in the token:
+- `se` — expiry datetime (when the link dies)
+- `sr` — resource type (`b` = blob)
+- `sp` — permissions (`r` = read only)
+- `sig` — cryptographic signature proving the token is legitimate
+
+The signature is what makes the token trustworthy. Azure Storage verifies the signature before granting access. A tampered token fails signature verification and gets rejected.
+
 ---
 
-## Fan-Out / Fan-In
+## Signing SAS Tokens: Two Options
 
-Running multiple activities in parallel through a single `yield`:
+### Option 1: Storage Account Key (not recommended)
 
 ```python
-export_tasks = [
-    context.call_activity("export_and_upload", job) for job in batch
-]
-export_results = yield context.task_all(export_tasks)
+sas_token = generate_blob_sas(
+    account_name=account_name,
+    container_name=container_name,
+    blob_name=blob_name,
+    account_key=account_key,        # static secret
+    permission=BlobSasPermissions(read=True),
+    expiry=now + timedelta(days=14),
+)
 ```
 
-`task_all` schedules all activities simultaneously. The framework waits until **every** activity finishes, then replays the orchestrator **once**. The `yield` returns a list of all results.
+The token is signed with the storage account key. If the key leaks, anyone can forge SAS tokens for any blob with any permissions and any expiry. No time limit on the damage.
 
-5 exports that take 30 seconds each finish in ~30 seconds total instead of ~150 seconds sequentially.
-
-**Critical:** If any activity in `task_all` throws an uncaught exception, the entire `task_all` fails. That's why `export_and_upload` catches errors internally and returns them as data in the dict, so `task_all` always succeeds and the orchestrator can handle failures per-job.
-
----
-
-## Batching
-
-Fan-out with rate limiting:
+### Option 2: User Delegation Key (recommended)
 
 ```python
-batch_size = 5
+# Step 1: Get a temporary signing key from Azure AD
+delegation_key = blob_service.get_user_delegation_key(
+    key_start_time=now,
+    key_expiry_time=now + timedelta(days=7),  # 7 days max, Azure enforced
+)
 
-for i in range(0, len(ready), batch_size):
-    batch = ready[i : i + batch_size]
-    export_tasks = [
-        context.call_activity("export_and_upload", job) for job in batch
-    ]
-    export_results = yield context.task_all(export_tasks)
+# Step 2: Sign the SAS token with the delegation key
+sas_token = generate_blob_sas(
+    account_name=account_name,
+    container_name=container_name,
+    blob_name=blob_name,
+    user_delegation_key=delegation_key,   # temporary key
+    permission=BlobSasPermissions(read=True),
+    expiry=now + timedelta(days=7),       # cannot exceed delegation key expiry
+)
 ```
 
-Why not `task_all` all 50 at once? API rate limits. Power BI's export API throttles concurrent requests. Batching to 5 keeps you under the ceiling. Also limits blast radius — if a batch fails, you lose 5 jobs, not 50.
+The delegation key is a temporary credential generated on demand through Azure AD. Tied to the managed identity. Maximum lifespan of 7 days (Azure hard limit — request 8 and the API rejects it).
 
 ---
 
-## Activity Input: Always One Value
+## Delegation Key vs Storage Account Key
 
-Activities receive a single input. Not two parameters, not keyword arguments. One value.
+Think of the SAS token as a hall pass. The signature is the stamp that makes it valid.
 
-For multiple pieces of data, pass a dict:
+| | Storage Account Key | User Delegation Key |
+|---|---|---|
+| Lifespan | Permanent until manually rotated | 7 days max |
+| Scope | Full access to entire storage account | Tied to a specific identity |
+| If leaked | Attacker has unlimited access | Damage is time-limited |
+| Audit trail | None | Azure AD logs who requested it |
+| Revocation | Rotate the key (breaks all existing SAS tokens) | Disable the identity |
+| Secrets to manage | Yes — must store key securely | None — managed identity handles it |
+
+---
+
+## The Expiry Trap
+
+The SAS token has its own expiry. The delegation key that signed it has its own expiry. **The shorter one wins.**
+
+If the delegation key expires in 7 days but the SAS token says 14 days, the link breaks on day 8. Azure checks both. The delegation key is dead, so the signature is no longer valid, and the SAS token returns a 403 Forbidden — even though the token's own expiry hasn't passed.
+
+**Rule: SAS token expiry must be ≤ delegation key expiry.**
+
+Both the SAS token expiry and delegation key expiry should be set to the same value (typically 7 days). Setting the SAS token expiry longer than the delegation key expiry results in download links that silently break — they return 403 Forbidden even though the token's own expiry hasn't passed.
+
+---
+
+## BlobServiceClient: The Entry Point
+
+Everything starts here:
 
 ```python
-# Orchestrator
-yield context.call_activity("get_sent", {"year": 2026, "month": 4})
+from azure.storage.blob import BlobServiceClient
 
-# Activity registration in function_app.py
-@app.activity_trigger(input_name="payload")
-def get_sent(payload: dict):
-    return _get_sent(payload["year"], payload["month"])
+blob_service = BlobServiceClient(
+    account_url=f"https://{account_name}.blob.core.windows.net",
+    credential=credential,
+)
 ```
 
----
-
-## Immutable Dict Pattern
-
-Activities should not mutate their input dict. Use `{**dict}` to create a new dict with additional fields:
+From the service client, you navigate down:
 
 ```python
-# GOOD — creates a new dict, original untouched
-return {**job, "sas_url": sas_url}
+# Get a reference to a container
+container_client = blob_service.get_container_client("reports")
 
-# BAD — mutates the original, can cause replay bugs
-job["sas_url"] = sas_url
-return job
-```
+# Get a reference to a specific blob
+blob_client = blob_service.get_blob_client(
+    container="reports",
+    blob="report.pdf",
+)
 
-Why: The orchestrator passes `job` into the activity. If the activity mutates it, the orchestrator's data changes from inside an activity. During replay, this can cause the orchestrator to see different data than the first run.
+# Upload
+blob_client.upload_blob(pdf_bytes, overwrite=True)
 
----
+# Download
+data = blob_client.download_blob().readall()
 
-## Separation: Wiring vs Logic
+# Delete
+blob_client.delete_blob()
 
-Decorators live in `function_app.py`. Business logic lives in the activity modules. Thin wrappers connect them:
-
-```python
-# function_app.py — wiring
-@app.activity_trigger(input_name="job")
-def export_and_upload(job: dict):
-    return _export_and_upload(job)
-
-# export_and_upload.py — logic
-def export_and_upload(job: dict) -> dict:
-    # actual Power BI export, blob upload, SAS generation
-    ...
-```
-
-Why: Activity code is plain Python. You can call it from a test script, a notebook, or another function without the Azure Functions framework. The decorators are the glue — they connect Azure's trigger system to your code. Swap the wiring without touching the logic. Test the logic without standing up the framework.
-
----
-
-## Async vs Sync
-
-Timer triggers and HTTP triggers are `async` because they `await` durable client calls. Activities are sync because they use synchronous libraries (httpx, pyodbc) and there's no benefit to async — each activity processes one job on its own thread.
-
-```python
-async def monthly_trigger(timer, client):    # async — awaits client.start_new()
-def build_snapshot(payload):                  # sync — blocking I/O, one job
+# List blobs in a container
+for blob in container_client.list_blobs():
+    print(blob.name)
 ```
 
 ---
 
-## Calling Functions Outside the Framework
+## Example: Report Delivery Pipeline Flow
 
-Not everything needs to go through `context.call_activity`. A plain timer function can import and call activity code directly:
+A practical example of blob storage in a report delivery pipeline:
 
-```python
-from exodus.activities.log_results import get_monthly_run_count
+1. **Export** — Generate a PDF report from a reporting service, download the bytes.
 
-@app.timer_trigger(arg_name="timer", schedule="0 0 14 2 * *")
-def pipeline_health_check(timer: func.TimerRequest):
-    count = get_monthly_run_count(year, month)
-```
+2. **Upload** — Create a `BlobServiceClient` with managed identity credentials. Upload the PDF with `overwrite=True`.
 
-The activity trigger decorator registers a function with the Durable Functions framework. Without the decorator, it's just a Python function. You only need `context.call_activity` inside orchestrators where replay and state persistence matter.
+3. **Delegation key** — Request a user delegation key valid for 7 days.
+
+4. **SAS token** — Generate a read-only SAS token signed by the delegation key, expiring in 7 days (matching the delegation key).
+
+5. **SAS URL** — Combine the blob URL with the SAS token. This becomes a shareable download link.
+
+6. **Return** — `{**job, "sas_url": sas_url}` — new dict with the SAS URL added, original job dict untouched (immutable dict pattern).
 
 ---
 
-## Quick Reference
+## Common Operations Reference
 
-| Concept | Rule |
+| Task | Method |
 |---|---|
-| Orchestrator I/O | Never. All I/O goes in activities. |
-| `datetime.now()` in orchestrator | Never. Use `context.current_utc_datetime`. |
-| Mutating input dicts in activities | Don't. Use `{**dict, "key": val}`. |
-| Activity input | Always one value. Use a dict for multiple fields. |
-| `task_all` failure | One uncaught exception kills the whole batch. Catch inside activities. |
-| Function names | `call_activity("name")` must match the decorated function name exactly. |
-| Replay count | One replay per completed `yield`. 10 yields = 10 replays. |
-| `task_all` replays | One replay for the entire batch, not per activity. |
+| Upload a file | `blob_client.upload_blob(data, overwrite=True)` |
+| Download a file | `blob_client.download_blob().readall()` |
+| Delete a blob | `blob_client.delete_blob()` |
+| List blobs | `container_client.list_blobs()` |
+| Check if blob exists | `blob_client.exists()` |
+| Get blob properties | `blob_client.get_blob_properties()` |
+| Create a container | `blob_service.create_container("name")` |
+| Get delegation key | `blob_service.get_user_delegation_key(start, expiry)` |
+| Generate SAS token | `generate_blob_sas(account, container, blob, ...)` |
+
+---
+
+## Key Imports
+
+```python
+from azure.storage.blob import (
+    BlobServiceClient,
+    BlobSasPermissions,
+    generate_blob_sas,
+)
+from azure.identity import DefaultAzureCredential
+from datetime import datetime, timedelta, timezone
+```
